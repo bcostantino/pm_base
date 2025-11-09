@@ -29,6 +29,28 @@ bool pm_check_ota_configured() {
            secure_config.pm_client_token[0] == '\0');
 }
 
+
+
+int configure_fs_config() {
+  if (!LittleFS.begin(true)) {
+    Serial.println("Failed to mount file system");
+    return 1;
+  }
+
+  if (!LittleFS.exists(CONFIG_LFS_PATH)) {
+    Serial.println("Config file doesn't exist, creating new one...");
+    pm_write_config_to_file();
+  }
+
+  if (!pm_load_config()) {
+    Serial.println("Failed to load config");
+    return 1;
+  }
+
+  Serial.println("config loaded");
+  return 0;
+}
+
 bool pm_write_config_to_file() {
   JsonDocument doc;
   doc["ssid"] = secure_config.ssid;
@@ -72,6 +94,32 @@ bool pm_load_config() {
   return true;
 }
 
+pm_error_t pm_deserialize_api_check_response(const char *response, update_check_info_t *_update_info) {
+  // TODO: currently uses ArduinoJson, should move this over to a more portable library
+  // Serial.print(response);
+  JsonDocument json;
+  DeserializationError error = deserializeJson(json, response);
+  if (error) {
+    Serial.printf("failed to deserialize json: %s\n", error.c_str());
+    return PM_ERR_CANT_DESERIALIZE;
+  }
+  
+  bool success = strcmp("success", json["status"]) == 0;
+  if (!success) {
+    // Serial.printf("internal object shows failure despite %d status code\n", status_code);
+    Serial.print(response);
+    Serial.println();
+    return PM_ERR_UNKNOWN;
+  }
+
+  // copy data to output struct
+  JsonObject data = json["data"];
+  bool ua = data["updates_available"].as<bool>();
+  String purl = data["releases"][0]["purl"].as<String>();
+  _update_info->updates_available = ua;
+  strcpy(_update_info->purl, purl.c_str());
+  return PM_OK;
+}
 
 int pm_tokenize_command(char *command, char **argv) {
   int argc = 0;
@@ -83,8 +131,61 @@ int pm_tokenize_command(char *command, char **argv) {
   return argc;
 }
 
+void pm_split_url(const char *url, char **base_url, char **path) {
+    // Find the end of the authority (host:port) part
+    // This assumes a standard URL format like scheme://host[:port]/path
+    const char *protocol_end = strstr(url, "://");
+    const char *start_of_path = NULL;
 
-// void check_for_updates(update_check_info_t *_update_info) {
+    if (protocol_end) {
+        start_of_path = strchr(protocol_end + 3, '/'); // Look for the first '/' after "://"
+    } else {
+        start_of_path = strchr(url, '/'); // No protocol, assume it starts with a path or host
+    }
+
+    if (start_of_path) {
+        // Calculate length of base URL
+        size_t base_len = start_of_path - url;
+        *base_url = (char *)malloc(base_len + 1);
+        if (*base_url) {
+            strncpy(*base_url, url, base_len);
+            (*base_url)[base_len] = '\0';
+        }
+
+        // Calculate length of path
+        size_t path_len = strlen(start_of_path);
+        *path = (char *)malloc(path_len + 1);
+        if (*path) {
+            strcpy(*path, start_of_path);
+        }
+    } else {
+        // No path found, the entire URL is the base
+        *base_url = (char *)malloc(strlen(url) + 1);
+        if (*base_url) {
+            strcpy(*base_url, url);
+        }
+        *path = (char *)malloc(1); // Empty string for path
+        if (*path) {
+            (*path)[0] = '\0';
+        }
+    }
+}
+
+bool str_is_null_or_empty(const char *str) {
+  return (str == NULL || *str == '\0');
+}
+
+// get patchmate API url to check for updates
+int pm_get_check_update_url(char *buffer, const char *host, const char *curr_vers) {
+  if (str_is_null_or_empty(curr_vers)) {
+    return sprintf(buffer, "http://%s/api/v0/updates", host);
+  } else {
+    return sprintf(buffer, "http://%s/api/v0/updates?current_versions=%s", host, curr_vers);
+  }
+}
+
+
+// void pm_esp_check_for_updates(update_check_info_t *_update_info) {
 //   WiFiClient client;
 //   HTTPClient http;
 
@@ -162,21 +263,20 @@ int pm_tokenize_command(char *command, char **argv) {
 //   return;
 // }
 
-void pm_esp_connect_to_wifi_block(unsigned long timeout_ms) {
+wl_status_t pm_esp_connect_to_wifi_block(unsigned long timeout_ms) {
   unsigned long start = millis();
   WiFi.begin(secure_config.ssid, secure_config.password);
   Serial.print("Connecting");
-  while (WiFi.status() != WL_CONNECTED) {
+  wl_status_t wl_status = WiFi.status();
+  while (wl_status != WL_CONNECTED) {
     if (millis() >= (start+timeout_ms)) break;
     delay(500);
     Serial.print(".");
+    wl_status = WiFi.status();
   }
   Serial.println();
 
-  if (WiFi.status() == WL_CONNECTED) 
-    Serial.printf("Successfully connected to WiFi network %s\n", WiFi.SSID().c_str());
-  else
-    Serial.printf("Failed to connect to WiFi network %s\n", secure_config.ssid);
+  return wl_status;
 }
 
 //see https://gist.github.com/mykeels/bc5eeb7de660bf6e9ac512274f150cc1
@@ -204,88 +304,167 @@ void pm_esp_list_wifi_networks() {
   }
 }
 
-int pm_cmd_set(const char *key, const char *val) {
-  if (strcmp("ssid", key) == 0) {
-    strcpy(secure_config.ssid, val);
-
-  } else if (strcmp("password", key) == 0) {
-    strcpy(secure_config.password, val);
-
-  } else if (strcmp("pm_host", key) == 0) {
-    strcpy(secure_config.pm_host, val);
-
-  } else if (strcmp("pm_client_id", key) == 0) {
-    strcpy(secure_config.pm_client_id, val);
-
-  } else if (strcmp("pm_client_token", key) == 0) {
-    strcpy(secure_config.pm_client_token, val);
-
-  } else {
-    return 1;
+// set a value in sec_conf_t struct
+pm_error_t pm_conf_set(const char *key, const char *val) {
+  for (size_t i = 0; i < CONFIG_TABLE_SIZE; ++i) {
+    if (strcmp(key, config_table[i].key) == 0) {
+      void *field = (char *)&secure_config + config_table[i].offset;
+      memset(field, 0, config_table[i].size);   // overwrite existing value with zeros
+      strncpy((char *)field, val, config_table[i].size - 1);
+      return PM_OK;
+    }
   }
 
-  return 0;
+  return PM_ERR_INVALID_ARG;
 }
 
-int pm_cmd_get(const char *key, char **val) {
+// get a value from sec_conf_t struct
+pm_error_t pm_conf_get(const char *key, char **val) {
+  for (size_t i = 0; i < CONFIG_TABLE_SIZE; ++i) {
+    if (strcmp(key, config_table[i].key) != 0) continue;
 
-  if (strcmp("ssid", key) == 0) {
-    *val = secure_config.ssid;
+    // set val pointer reference to field value
+    void *field = (char *)&secure_config + config_table[i].offset;
+    *val = (char *)field;
+    return PM_OK;
+  }
+  return PM_ERR_INVALID_ARG;
+}
 
-  } else if (strcmp("password", key) == 0) {
-    *val = secure_config.password;
+// used to determine if provided key points to a namespace or specific field
+bool pm_conf_is_ns(const char *key) {
+  size_t key_len = strlen(key);
+  for (size_t i = 0; i < CONFIG_TABLE_SIZE; ++i) {
+    const char *entry_key = config_table[i].key;
 
-  } else if (strcmp("pm_host", key) == 0) {
-    *val = secure_config.pm_host;
+    // match if entry starts with "key." but isn't exactly "key"
+    if (strncmp(entry_key, key, key_len) == 0 && entry_key[key_len] == '.') {
+      return true;
+    }
+  }
+  return false;
+}
 
-  } else if (strcmp("pm_client_id", key) == 0) {
-    *val = secure_config.pm_client_id;
+size_t pm_conf_get_ns_fields(const char *ns, const char **out_keys, size_t max_keys) {
+  size_t ns_len = strlen(ns);
+  size_t count = 0;
 
-  } else if (strcmp("pm_client_token", key) == 0) {
-    *val = secure_config.pm_client_token;
+  for (size_t i = 0; i < CONFIG_TABLE_SIZE; ++i) {
+    const char *key = config_table[i].key;
 
-  } else {
-    return 1;
+    // Must start with "namespace."
+    if (strncmp(key, ns, ns_len) == 0 && key[ns_len] == '.') {
+      const char *suffix = key + ns_len + 1;  // skip "namespace."
+      // Only include *direct* children (no further dots)
+      if (strchr(suffix, '.') == NULL) {
+        if (count < max_keys) {
+          out_keys[count] = key;
+        }
+        count++;
+      }
+    }
   }
 
-  return 0;
+  return count;
 }
 
 
-int pm_cmd_get_set(int argc, char *argv[]) {
+// int pm_cmd_set(const char *key, const char *val) {
+//   if (strcmp("ssid", key) == 0) {
+//     strcpy(secure_config.ssid, val);
+
+//   } else if (strcmp("password", key) == 0) {
+//     strcpy(secure_config.password, val);
+
+//   } else if (strcmp("pm_host", key) == 0) {
+//     strcpy(secure_config.pm_host, val);
+
+//   } else if (strcmp("pm_client_id", key) == 0) {
+//     strcpy(secure_config.pm_client_id, val);
+
+//   } else if (strcmp("pm_client_token", key) == 0) {
+//     strcpy(secure_config.pm_client_token, val);
+
+//   } else {
+//     return 1;
+//   }
+
+//   return 0;
+// }
+
+// int pm_cmd_get(const char *key, char **val) {
+
+//   if (strcmp("ssid", key) == 0) {
+//     *val = secure_config.ssid;
+
+//   } else if (strcmp("password", key) == 0) {
+//     *val = secure_config.password;
+
+//   } else if (strcmp("pm_host", key) == 0) {
+//     *val = secure_config.pm_host;
+
+//   } else if (strcmp("pm_client_id", key) == 0) {
+//     *val = secure_config.pm_client_id;
+
+//   } else if (strcmp("pm_client_token", key) == 0) {
+//     *val = secure_config.pm_client_token;
+
+//   } else {
+//     return 1;
+//   }
+
+//   return 0;
+// }
+
+
+pm_error_t pm_cmd_get_set(int argc, char *argv[]) {
   bool is_set = strcmp("set", argv[0]) == 0;
   if (!is_set && argc < 2) {
     Serial.println("error: get command requires one argument: get <KEY>");
-    return 1;
+    return PM_ERR_INVALID_ARG;
   }
   if (is_set && argc < 3) {
     Serial.println("error: set command requires two arguments: set <KEY> <VALUE>");
-    return 1;
+    return PM_ERR_INVALID_ARG;
   }
 
-  int status = 0;
+  pm_error_t status;
   const char *key = argv[1];
   if (is_set) {
     const char *_val = argv[2];
-    status = pm_cmd_set(key, _val);
+    status = pm_conf_set(key, _val);
     if (status == 0) {
       pm_write_config_to_file();  // update file with changed config
       Serial.println("ok");
     }
   } else {
-    char *val;
-    status = pm_cmd_get(key, &val);
-    if (status == 0) {
-      Serial.printf("%s: %s\n", key, val);
+    // list all namespace
+    if (pm_conf_is_ns(key)) {
+      const char *keys[CONFIG_TABLE_SIZE];
+      size_t count = pm_conf_get_ns_fields(key, keys, CONFIG_TABLE_SIZE);
+      for (size_t i = 0; i < count && i < 8; ++i) {
+        char *val;
+        status = pm_conf_get(keys[i], &val);
+        if (status == 0) {
+          Serial.printf("%s: %s\n", keys[i], val);
+        }
+      }
+
+    // print conf key
+    } else {
+      char *val;
+      status = pm_conf_get(key, &val);
+      if (status == 0) {
+        Serial.printf("%s: %s\n", key, val);
+      }
     }
   }
 
   if (status != 0) {
     Serial.printf("error: key \"%s\" unknown\n", key);
-    return 1;
   }
 
-  return 0;
+  return status;
 }
 
 // void update_started() {
